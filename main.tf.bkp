@@ -1,0 +1,240 @@
+# Configure Azure Provider
+provider "azurerm" {
+  features {}
+  use_oidc = true
+  # Explicitly set these values from your Azure CLI session
+  subscription_id = data.external.azure_cli.result.subscription_id
+}
+
+# Get Azure CLI context
+data "external" "azure_cli" {
+  program = ["az", "account", "show", "--query", "{ subscription_id: id }", "--output", "json"]
+}
+
+# Create Resource Group
+resource "azurerm_resource_group" "proxy_rg" {
+  name     = "proxy-server-rg"
+  location = "East US"  # Change this to your preferred region
+}
+
+# Create Virtual Network
+resource "azurerm_virtual_network" "proxy_vnet" {
+  name                = "proxy-vnet"
+  address_space       = ["10.0.0.0/16"]
+  location            = azurerm_resource_group.proxy_rg.location
+  resource_group_name = azurerm_resource_group.proxy_rg.name
+}
+
+# Create Subnet
+resource "azurerm_subnet" "proxy_subnet" {
+  name                 = "proxy-subnet"
+  resource_group_name  = azurerm_resource_group.proxy_rg.name
+  virtual_network_name = azurerm_virtual_network.proxy_vnet.name
+  address_prefixes     = ["10.0.1.0/24"]
+}
+
+# Create Public IP
+resource "azurerm_public_ip" "proxy_public_ip" {
+  name                = "proxy-public-ip"
+  location            = azurerm_resource_group.proxy_rg.location
+  resource_group_name = azurerm_resource_group.proxy_rg.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+# Create Network Security Group
+resource "azurerm_network_security_group" "proxy_nsg" {
+  name                = "proxy-nsg"
+  location            = azurerm_resource_group.proxy_rg.location
+  resource_group_name = azurerm_resource_group.proxy_rg.name
+
+  security_rule {
+    name                       = "SSH"
+    priority                   = 1001
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "Proxy"
+    priority                   = 1002
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "3128"  # Standard port for Squid proxy
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+}
+
+# Create Network Interface
+resource "azurerm_network_interface" "proxy_nic" {
+  name                = "proxy-nic"
+  location            = azurerm_resource_group.proxy_rg.location
+  resource_group_name = azurerm_resource_group.proxy_rg.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.proxy_subnet.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.proxy_public_ip.id
+  }
+}
+
+# Connect the security group to the network interface
+resource "azurerm_network_interface_security_group_association" "proxy_nsg_association" {
+  network_interface_id      = azurerm_network_interface.proxy_nic.id
+  network_security_group_id = azurerm_network_security_group.proxy_nsg.id
+}
+
+# Create Virtual Machine
+resource "azurerm_linux_virtual_machine" "proxy_vm" {
+  name                = "proxy-vm"
+  resource_group_name = azurerm_resource_group.proxy_rg.name
+  location            = azurerm_resource_group.proxy_rg.location
+  size                = "Standard_B1s"  # Change this according to your needs
+  admin_username      = "azureuser"
+
+  network_interface_ids = [
+    azurerm_network_interface.proxy_nic.id,
+  ]
+
+  admin_ssh_key {
+    username   = "azureuser"
+    public_key = file("~/.ssh/id_rsa.pub")  # Make sure you have this SSH key
+  }
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "UbuntuServer"
+    sku       = "18.04-LTS"
+    version   = "latest"
+  }
+
+  custom_data = base64encode(<<-EOF
+              #!/bin/bash
+              
+              # Update and install Squid
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y squid
+              
+              # Backup original config
+              cp /etc/squid/squid.conf /etc/squid/squid.conf.backup
+              
+              # Create new Squid configuration
+              cat > /etc/squid/squid.conf <<'END'
+              # Basic configuration
+              http_port 3128
+              
+              # Access Control Lists (ACL)
+              acl SSL_ports port 443
+              acl Safe_ports port 80          # http
+              acl Safe_ports port 21          # ftp
+              acl Safe_ports port 443         # https
+              acl Safe_ports port 70          # gopher
+              acl Safe_ports port 210         # wais
+              acl Safe_ports port 1025-65535  # unregistered ports
+              acl Safe_ports port 280         # http-mgmt
+              acl Safe_ports port 488         # gss-http
+              acl Safe_ports port 591         # filemaker
+              acl Safe_ports port 777         # multiling http
+              acl CONNECT method CONNECT
+              
+              # Deny requests to certain unsafe ports
+              http_access deny !Safe_ports
+              
+              # Deny CONNECT to other than secure SSL ports
+              http_access deny CONNECT !SSL_ports
+              
+              # Allow localhost
+              acl localhost src 127.0.0.1/32
+              http_access allow localhost
+              
+              # Allow all other requests
+              http_access allow all
+              
+              # Enhanced anonymity settings
+              request_header_access From deny all
+              request_header_access Server deny all
+              request_header_access WWW-Authenticate deny all
+              request_header_access Link deny all
+              request_header_access Cache-Control deny all
+              request_header_access Proxy-Connection deny all
+              request_header_access X-Cache deny all
+              request_header_access X-Cache-Lookup deny all
+              request_header_access Via deny all
+              request_header_access X-Forwarded-For deny all
+              request_header_access Pragma deny all
+              request_header_access Keep-Alive deny all
+              
+              # Disable cache headers
+              via off
+              forwarded_for delete
+              follow_x_forwarded_for deny all
+              request_header_access Authorization allow all
+              request_header_access Proxy-Authorization allow all
+              request_header_access Connection allow all
+              request_header_access User-Agent allow all
+              
+              # Performance settings
+              cache_mem 256 MB
+              maximum_object_size 1024 MB
+              cache_replacement_policy heap LFUDA
+              
+              # DNS settings
+              dns_v4_first on
+              
+              # Logging
+              access_log /var/log/squid/access.log
+              cache_log /var/log/squid/cache.log
+              
+              # Strip all client identifying information
+              header_replace User-Agent Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+              header_replace From "Anonymous"
+              
+              # Additional anonymity settings
+              request_header_access Referer deny all
+              request_header_access X-Forwarded-Host deny all
+              request_header_access X-Forwarded-Server deny all
+              request_header_access X-Real-IP deny all
+              
+              # Hide client IP
+              forwarded_for off
+              request_header_access All deny all
+              request_header_access Accept allow all
+              request_header_access Accept-Charset allow all
+              request_header_access Accept-Encoding allow all
+              request_header_access Accept-Language allow all
+              request_header_access Host allow all
+              END
+              
+              # Set correct permissions
+              chown -R proxy:proxy /etc/squid
+              
+              # Restart Squid to apply changes
+              systemctl restart squid
+              
+              # Enable Squid to start on boot
+              systemctl enable squid
+              
+              # Verify Squid is running
+              systemctl status squid
+              EOF
+  )
+}
+
+# Output the public IP address
+output "proxy_public_ip" {
+  value = azurerm_public_ip.proxy_public_ip.ip_address
+}
